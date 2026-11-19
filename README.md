@@ -67,6 +67,7 @@ it by*:
   - [Confidence Calibration Metrics](#confidence-calibration-metrics)
   - [Regression Calibration Metrics](#regression-calibration-metrics)
 - [Methods](#methods)
+  - [Calibration Data from Asynchronous Labels](#calibration-data-from-asynchronous-labels)
   - [Confidence Calibration Methods](#confidence-calibration-methods)
     - [Binning](#binning)
     - [Scaling](#scaling)
@@ -248,6 +249,7 @@ The framework is structured as follows:
       .presentation    # presentation methods (confidence/regression calibration)
       .metrics         # metrics for measuring miscalibration (confidence/regression calibration)
       .regression      # methods for regression uncertainty calibration (regression calibration)
+      .data            # pairing of asynchronous predictions and labels by sample ID
 
     examples           # example code snippets
 
@@ -350,6 +352,53 @@ observed error variance which is equivalent to then Mean Squared Error
 We further give an overview about the post-hoc calibration methods for
 (semantic) confidence calibration as well as about the methods for
 regression uncertainty calibration.
+
+### Calibration Data from Asynchronous Labels
+
+In many applications predictions are available immediately while the
+ground truth arrives later, out of order, and might be corrected
+afterwards. Concatenating prediction and label arrays by position is
+wrong in this setting because it pairs a prediction with the label of a
+different sample as soon as one stream lags behind.
+
+The *netcal.data* package provides
+*netcal.data.CalibrationDataBuilder*, which constructs the calibration
+data by identity instead of by array position. Predictions are keyed by
+`(sample_id, model_version)` and labels by `(sample_id, label_version)`:
+
+- only predictions and labels of the same sample are joined;
+- of all labels valid at the declared label cutoff, the newest revision
+  is used - a revised label revokes the pairing with the old revision;
+- conflicting labels for the same sample and label version are rejected;
+- predictions without a valid label stay in the pending population and
+  are never filled with zero labels;
+- duplicated deliveries are idempotent and never increase the weight.
+
+The paired, real `X`/`y` feed the existing calibration methods and
+metrics directly, and the label versions that were used are stored on
+the fitted model:
+
+```python
+from netcal.data import CalibrationDataBuilder
+from netcal.binning import HistogramBinning
+from netcal.metrics import ECE
+
+builder = CalibrationDataBuilder(label_cutoff=1_700_000_000)
+builder.add_predictions(sample_ids, model_versions, confidences)
+builder.add_labels(label_sample_ids, label_versions, labels,
+                   timestamps=label_timestamps)
+
+dataset = builder.build()
+print(dataset.n_matched, dataset.pending_sample_ids)
+
+calibrator = builder.fit(HistogramBinning(bins=10))
+print(calibrator.label_versions_)   # provenance of the training rows
+
+ece = builder.measure(ECE(bins=10))  # evaluated on the very same pairing
+```
+
+See the documentation of *netcal.data* for details on label revisions,
+model versions and label revocation.
 
 ### Confidence Calibration Methods
 

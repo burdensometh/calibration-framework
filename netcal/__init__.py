@@ -25,6 +25,7 @@ Available packages
    metrics
    presentation
    regression
+   data
 
 
 Each calibration method must inherit the base class :class:`AbstractCalibration`. If you want to write your own method and
@@ -49,3 +50,6 @@ from .Decorator import accepts, dimensions, global_accepts, global_dimensions
 from .Context import manual_seed, redirect
 from .Stats import hpdi, mv_cauchy_log_density
 from .Helper import squeeze_generic, meanvar, cumulative, is_in_quantile, cumulative_moments, density_from_cumulative
+
+# note: 'netcal.data' is intentionally not imported here to keep the import graph flat;
+# use "from netcal.data import CalibrationDataBuilder".

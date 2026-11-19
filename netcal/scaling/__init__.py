@@ -17,6 +17,7 @@ Available classes
    :template: custom_class.rst
 
    AbstractLogisticRegression
+   PosteriorSamplingPlan
    LogisticCalibration
    LogisticCalibrationDependent
    TemperatureScaling
@@ -25,6 +26,7 @@ Available classes
 """
 
 from .AbstractLogisticRegression import AbstractLogisticRegression
+from .SamplingPlan import PosteriorSamplingPlan
 
 from .LogisticCalibration import LogisticCalibration
 from .LogisticCalibrationDependent import LogisticCalibrationDependent

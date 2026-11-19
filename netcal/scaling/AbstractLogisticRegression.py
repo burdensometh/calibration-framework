@@ -6,6 +6,7 @@
 # file, You can obtain one at https://www.apache.org/licenses/LICENSE-2.0.txt.
 
 from typing import Tuple, List
+import uuid
 import warnings
 from collections import OrderedDict, defaultdict
 from typing import Union
@@ -29,6 +30,7 @@ from pyro.optim import Adam, SGD
 import pyro.distributions as dist
 
 from netcal import AbstractCalibration, dimensions, accepts, manual_seed, squeeze_generic
+from .SamplingPlan import PosteriorSamplingPlan
 
 
 class AbstractLogisticRegression(AbstractCalibration):
@@ -171,6 +173,15 @@ class AbstractLogisticRegression(AbstractCalibration):
         self.mask_negative = False
         self._sites = None
 
+        # fitting generation is incremented on every fit/clear and binds posterior sampling plans
+        # to the concrete model state they have been created from
+        self._fit_generation = 0
+
+        # unique identity of this model instance so that a plan cannot be applied to a different,
+        # independently fitted model even if its fitting generation happens to match.
+        # The id is deterministic across pickle round-trips, which allows plan reuse in worker processes.
+        self._model_uid = uuid.uuid4().hex
+
     def save_model(self, filename: str):
         """
         Save model instance as with torch's save function as this is safer for torch tensors.
@@ -193,6 +204,9 @@ class AbstractLogisticRegression(AbstractCalibration):
         # call parental clear method and clear parameter store of pyro
         super().clear()
         pyro.clear_param_store()
+
+        # invalidate all sampling plans that might reference the old posterior
+        self._fit_generation += 1
 
         self.num_features = None
         self._sites = None
@@ -542,10 +556,34 @@ class AbstractLogisticRegression(AbstractCalibration):
                 pbar.set_description("SVI Loss: %.5f" % epoch_loss)
                 pbar.update(1)
 
-        self.vi_model = pyro.get_param_store().get_state()
+        self.vi_model = self._detached_param_state(pyro.get_param_store().get_state())
 
         if tensorboard:
             writer.close()
+
+    @staticmethod
+    def _detached_param_state(state: dict) -> 'OrderedDict':
+        """
+        Return a picklable deep copy of a pyro parameter store state.
+
+        Modern pyro attaches an ``unconstrained`` weak reference to constrained parameter tensors. Such a
+        weak reference cannot be pickled and would break model saving once the global parameter store has
+        been restored via ``set_state`` (e.g. while creating a sampling plan). Detaching every stored tensor
+        yields plain leaf tensors without these internal references while preserving all numeric values.
+        """
+
+        clean_state = OrderedDict()
+        for key, value in state.items():
+
+            if key == 'params' and isinstance(value, dict):
+                clean_state[key] = OrderedDict(
+                    (name, param.detach().clone() if isinstance(param, torch.Tensor) else param)
+                    for name, param in value.items()
+                )
+            else:
+                clean_state[key] = value
+
+        return clean_state
 
     def convex(self, data: torch.Tensor, y: torch.Tensor, tensorboard: bool, log_dir: str):
         """
@@ -717,12 +755,166 @@ class AbstractLogisticRegression(AbstractCalibration):
 
     # -----------------------------------------------------------------
 
+    def _dummy_input(self, dtype: torch.dtype) -> torch.Tensor:
+        """
+        Create a minimal valid *prepared* input tensor matching the feature structure of the model.
+        Posterior draws only depend on the prior/guide sites and not on the concrete data values, thus the
+        actual values are irrelevant - the tensor merely needs to pass the model's shape-dependent operations.
+
+        Instead of reconstructing the (model-specific and possibly transformed, e.g. feature-doubling)
+        prepared feature layout manually, a single row of valid raw confidence input is routed through the
+        usual :meth:`prepare` pipeline so that every subclass yields the correct shape on its own.
+        """
+
+        if self.detection:
+            # detection input always has 2 dimensions with confidence as the first feature
+            dummy_raw = np.full((1, self.num_features), 0.5, dtype=self.dtypes[dtype])
+        elif self._is_binary_classification():
+            dummy_raw = np.full((1,), 0.5, dtype=self.dtypes[dtype])
+        else:
+            # multiclass softmax input with one uniform row per class
+            dummy_raw = np.full((1, self.num_classes), 1. / self.num_classes, dtype=self.dtypes[dtype])
+
+        return self.prepare(dummy_raw).to(self._device)
+
+    def _sample_posterior_parameters(
+            self,
+            num_samples: int,
+            random_state: int = None,
+            reference_data: torch.Tensor = None
+    ) -> Tuple['OrderedDict[str, torch.Tensor]', torch.Tensor]:
+        """
+        Materialize posterior parameter draws without applying them to any input data.
+
+        This is the *random* part of a probabilistic transform. Its output only depends on the fitted
+        posterior (MCMC chain samples or the variational parameter store) and the random state - never on
+        the input data that is calibrated later on. Consequently, the very same draws can be applied to
+        arbitrary input chunks while preserving the parameter identity (and thus the sample correlation).
+
+        Parameters
+        ----------
+        num_samples : int
+            Number of parameter draws to materialize.
+        random_state : int, optional, default: None
+            Fix the random seed for the random number generation.
+        reference_data : torch.Tensor, optional
+            Prepared input data used to trace the pyro model on Variational Inference. If None, a minimal
+            dummy input with matching feature structure is created internally.
+
+        Returns
+        -------
+        tuple of (OrderedDict, torch.Tensor or None)
+            Ordered dict of CPU tensors with shape (num_samples, num_parameters_of_site) for each site,
+            together with the selected MCMC chain indices (None for Variational Inference).
+        """
+
+        if self.mcmc_model is not None:
+
+            with manual_seed(seed=random_state):
+                idxs = torch.randint(0, self.mcmc_steps, size=(num_samples,), device=self._device)
+                samples = {k: v.index_select(0, idxs) for k, v in self.mcmc_model.items()}
+                idxs = idxs.detach().cpu()
+
+        elif self.vi_model is not None:
+
+            # restore state of global parameter store of pyro and use this parameter store for the predictive.
+            # set_state reuses the stored tensors which then carry pyro-internal weak references; refresh the
+            # saved snapshot with detached copies so that the model remains picklable afterwards.
+            pyro.get_param_store().set_state(self.vi_model)
+            self.vi_model = self._detached_param_state(pyro.get_param_store().get_state())
+
+            if reference_data is None:
+                dtype = next(iter(self.vi_model['params'].values())).dtype
+                reference_data = self._dummy_input(dtype)
+
+            predictive = Predictive(self.model, guide=self.guide,
+                                    num_samples=num_samples,
+                                    return_sites=tuple(self._sites.keys()))
+
+            with manual_seed(seed=random_state):
+                samples = predictive(reference_data)
+
+            idxs = None
+
+        else:
+            raise ValueError("Internal error: neither MCMC nor variational model given.")
+
+        # remove unnecessary dims that possibly occur on MCMC or VI and detach from any computation graph
+        samples = OrderedDict(
+            (k, torch.squeeze(v, dim=1).detach().cpu()) for k, v in samples.items()
+        )
+
+        return samples, idxs
+
+    def create_sampling_plan(
+            self,
+            num_samples: int = 1000,
+            random_state: int = None
+    ) -> PosteriorSamplingPlan:
+        """
+        Create a reusable :class:`~netcal.scaling.SamplingPlan.PosteriorSamplingPlan` that fixes the parameter
+        identities drawn from the posterior once, so that the same set of parameter draws can be applied to
+        several input chunks.
+
+        The plan is bound to the current fitting generation, the inference method, the parameter structure and
+        the dtype of the fitted model. Re-fitting or clearing the model increments the fitting generation and
+        invalidates the plan; applying a stale plan raises a :class:`RuntimeError`.
+
+        Parameters
+        ----------
+        num_samples : int, optional, default: 1000
+            Number of posterior parameter draws (parameter identities) to materialize.
+        random_state : int, optional, default: None
+            Fix the random seed used to draw the parameter identities.
+
+        Returns
+        -------
+        PosteriorSamplingPlan
+            Reusable sampling plan to be passed as ``sampling_plan`` argument to
+            :meth:`transform` for every input chunk.
+
+        Raises
+        ------
+        RuntimeError
+            If the model has not been fitted with method 'variational' or 'mcmc'.
+        """
+
+        if self.method not in ('variational', 'mcmc'):
+            raise RuntimeError(
+                "A posterior sampling plan can only be created for probabilistic methods 'variational' and "
+                "'mcmc', but current method is '%s'." % self.method)
+
+        if self._sites is None or (self.mcmc_model is None and self.vi_model is None):
+            raise RuntimeError("Could not create a sampling plan before fitting the model.")
+
+        if not isinstance(num_samples, int) or num_samples <= 0:
+            raise ValueError("Parameter 'num_samples' must be a positive integer.")
+
+        samples, mcmc_indices = self._sample_posterior_parameters(num_samples, random_state=random_state)
+
+        dtype = next(iter(samples.values())).dtype
+        site_structure = OrderedDict((name, tuple(tensor.shape[1:])) for name, tensor in samples.items())
+
+        return PosteriorSamplingPlan(
+            method=self.method,
+            samples=samples,
+            fit_generation=self._fit_generation,
+            model_uid=self._model_uid,
+            dtype=dtype,
+            site_structure=site_structure,
+            random_state=random_state,
+            mcmc_indices=mcmc_indices,
+        )
+
+    # -----------------------------------------------------------------
+
     def transform(
             self,
             X: np.ndarray,
             num_samples: int = 1000,
             random_state: int = None,
-            mean_estimate: bool = False
+            mean_estimate: bool = False,
+            sampling_plan: PosteriorSamplingPlan = None
     ) -> np.ndarray:
         """
         After model calibration, this function is used to get calibrated outputs of uncalibrated
@@ -736,11 +928,21 @@ class AbstractLogisticRegression(AbstractCalibration):
             On detection, this array must have 2 dimensions with number of additional box features in last dim.
         num_samples : int, optional, default: 1000
             Number of samples generated on MCMC sampling or Variational Inference.
+            Ignored if a reusable ``sampling_plan`` is passed.
         random_state : int, optional, default: None
-            Fix the random seed for the random number
+            Fix the random seed for the random number.
+            Ignored if a reusable ``sampling_plan`` is passed because the parameter identities are fixed then.
         mean_estimate : bool, optional, default: False
             If True, directly return the mean on probabilistic methods like MCMC or VI instead of the full
             distribution. This parameter has no effect on MLE.
+        sampling_plan : PosteriorSamplingPlan, optional, default: None
+            Reusable sampling plan created by :meth:`create_sampling_plan`. If given, the fixed posterior
+            parameter draws of the plan are applied to the input instead of drawing new random parameters.
+            Pass the same plan to several chunked ``transform`` calls to keep the parameter identities (and
+            thus the sample correlations) aligned across chunks; the concatenated chunk results then match a
+            single transform of the complete batch up to floating point tolerance. The plan is validated
+            against the current fitting generation, method, parameter structure and dtype - a stale plan
+            from a previous fit raises a :class:`RuntimeError`. Cannot be combined with ``mean_estimate``.
 
         Returns
         -------
@@ -779,9 +981,21 @@ class AbstractLogisticRegression(AbstractCalibration):
         if dtype not in self.dtypes:
             raise RuntimeError("Unsupported input data type: ", data.dtype)
 
+        # sampling plans only exist for probabilistic posterior methods
+        if sampling_plan is not None and self.method not in ['variational', 'mcmc']:
+            raise RuntimeError(
+                "A posterior sampling plan cannot be applied with inference method '%s'. "
+                "Use 'variational' or 'mcmc' instead." % self.method)
+
         # if weights is 2-D matrix, we are in sampling mode
         # treat each row as a separate weights vector
         if self.method in ['variational', 'mcmc']:
+
+            if sampling_plan is not None and mean_estimate:
+                raise ValueError(
+                    "A posterior sampling plan defines concrete parameter identities and cannot be combined "
+                    "with 'mean_estimate=True'. Either pass the plan without mean estimate to obtain the full "
+                    "posterior distribution or call transform without a plan for the mean estimate.")
 
             if mean_estimate:
                 weights = {}
@@ -800,7 +1014,11 @@ class AbstractLogisticRegression(AbstractCalibration):
                 # on variational inference, use mean of the variational distribution for inference
                 elif self.vi_model is not None:
                     for name, site in self._sites.items():
-                        weights[name] = torch.from_numpy(self.vi_model['params']['%s_mean' % name]).to(self._device)
+                        param = self.vi_model['params']['%s_mean' % name]
+                        if isinstance(param, torch.Tensor):
+                            weights[name] = param.detach().to(self._device)
+                        else:
+                            weights[name] = torch.from_numpy(param).to(self._device)
 
                         if weights[name].dtype != dtype:
                             raise RuntimeError("Training dtype %s does not match to passed data dtype %s." % (weights[name].dtype, dtype))
@@ -813,31 +1031,22 @@ class AbstractLogisticRegression(AbstractCalibration):
                 calibrated = squeeze_generic(calibrated, axes_to_keep=0)
             else:
 
-                parameter = []
-                if self.mcmc_model is not None:
+                if sampling_plan is not None:
 
-                    with manual_seed(seed=random_state):
-                        idxs = torch.randint(0, self.mcmc_steps, size=(num_samples,), device=self._device)
-                        samples = {k: v.index_select(0, idxs) for k, v in self.mcmc_model.items()}
-
-                elif self.vi_model is not None:
-
-                    # restore state of global parameter store of pyro and use this parameter store for the predictive
-                    pyro.get_param_store().set_state(self.vi_model)
-                    predictive = Predictive(self.model, guide=self.guide,
-                                            num_samples=num_samples,
-                                            return_sites=tuple(self._sites.keys()))
-
-                    with manual_seed(seed=random_state):
-                        samples = predictive(data)
+                    # assert that the plan still belongs to the current model state and matches the input dtype
+                    sampling_plan.validate(self, dtype=dtype)
+                    samples = sampling_plan.samples
+                    num_samples = sampling_plan.num_draws
 
                 else:
-                    raise ValueError("Internal error: neither MCMC nor variational model given.")
 
-                # remove unnecessary dims that possibly occur on MCMC or VI
-                samples = {k: torch.squeeze(v, dim=1) for k, v in samples.items()}
+                    # no reusable plan: draw fresh random parameter identities for this transform call
+                    samples, _ = self._sample_posterior_parameters(
+                        num_samples, random_state=random_state, reference_data=data
+                    )
 
                 # iterate over all parameter sets
+                parameter = []
                 for i in range(num_samples):
                     param_dict = {}
 

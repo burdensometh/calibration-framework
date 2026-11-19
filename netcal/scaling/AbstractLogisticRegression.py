@@ -171,6 +171,30 @@ class AbstractLogisticRegression(AbstractCalibration):
         self.mask_negative = False
         self._sites = None
 
+        # one binary calibration model per class on independent multi-label data
+        self._multiclass_instances = []
+
+    def _new_binary_instance(self) -> 'AbstractLogisticRegression':
+        """Create a fresh binary instance of this class with identical hyperparameters and data type."""
+
+        params = dict(
+            method=self.method,
+            momentum_epochs=self.momentum_epochs,
+            mcmc_steps=self.mcmc_steps,
+            mcmc_chains=self.mcmc_chains,
+            mcmc_warmup_steps=self.mcmc_warmup,
+            vi_epochs=self.vi_epochs,
+            detection=self.detection,
+            independent_probabilities=False,
+            use_cuda=str(self._device) if self._device.type == 'cuda' else False,
+        )
+
+        # temperature scaling shares the constructor of logistic calibration
+        if hasattr(self, 'temperature_only'):
+            params['temperature_only'] = self.temperature_only
+
+        return self.__class__(**params)
+
     def save_model(self, filename: str):
         """
         Save model instance as with torch's save function as this is safer for torch tensors.
@@ -199,6 +223,9 @@ class AbstractLogisticRegression(AbstractCalibration):
 
         self.mcmc_model = None
         self.vi_model = None
+
+        # one binary calibration model per class on independent multi-label data
+        self._multiclass_instances = []
 
     @abc.abstractmethod
     def prepare(self, X: np.ndarray) -> torch.Tensor:
@@ -311,7 +338,14 @@ class AbstractLogisticRegression(AbstractCalibration):
             else:
                 raise ValueError("Method is currently not implemented for other distributions than 'Independent', 'LogNormal' or 'Normal'.")
 
-        assert isinstance(self._sites, OrderedDict), "Method \'prior\' has to set all necessary initialization values and priors."
+        assert isinstance(self._sites, OrderedDict) or self._multilabel, \
+            "Method \'prior\' has to set all necessary initialization values and priors."
+
+        # independent multi-label models keep their parameters in per-class child instances
+        if self._sites is None and self._multilabel:
+            for _, instance in self._multiclass_instances:
+                instance.to(device)
+            return
 
         for name, site in self._sites.items():
 
@@ -340,14 +374,15 @@ class AbstractLogisticRegression(AbstractCalibration):
             for key, param in self.mcmc_model.items():
                 self.mcmc_model[key] = param.detach().to(device)
 
-    @dimensions((1, 2), (1, 2), None, None, None)
+    @dimensions((1, 2), (1, 2), None, None, None, None)
     def fit(
             self,
             X: np.ndarray,
             y: np.ndarray,
             random_state: int = None,
             tensorboard: bool = True,
-            log_dir: str = None
+            log_dir: str = None,
+            mask: np.ndarray = None
     ) -> 'AbstractLogisticRegression':
         """
         Build logitic calibration model either conventional with single MLE estimate or with
@@ -362,8 +397,14 @@ class AbstractLogisticRegression(AbstractCalibration):
         y : np.ndarray, shape=(n_samples, [n_classes])
             NumPy array with ground truth labels.
             Either as label vector (1-D) or as one-hot encoded ground truth array (2-D).
+            In independent multi-label mode (``independent_probabilities=True``), a 2-D array with
+            per-class binary labels is expected; unknown labels are encoded as ``numpy.nan`` or
+            passed through ``mask``.
         random_state : int, optional, default: None
             Fix the random seed for the random number
+        mask : np.ndarray of bool, shape=(n_samples, [n_classes]), optional, default: None
+            Label observation mask for independent multi-label data. ``True`` marks a label as
+            known. Unknown labels are excluded per class and are never treated as negatives.
 
         Returns
         -------
@@ -371,7 +412,16 @@ class AbstractLogisticRegression(AbstractCalibration):
             Instance of class :class:`AbstractLogisticRegression`.
         """
 
-        X, y = super().fit(X, y)
+        X, y = super().fit(X, y, mask=mask)
+
+        # independent multi-label data: fit one binary calibration model per class, each using
+        # only its observed labels. No row is dropped globally, so known labels of other classes
+        # are preserved. Classes that cannot be fitted are recorded for an explicit fallback.
+        if self._multilabel:
+            self._multiclass_instances = self._create_one_vs_all_models(
+                X, y, self.__class__, model_factory=self._new_binary_instance
+            )
+            return self
 
         # prepare data input for algorithm
         data = self.prepare(X).to(self._device)
@@ -769,6 +819,15 @@ class AbstractLogisticRegression(AbstractCalibration):
 
         # prepare input data
         X = super().transform(X)
+
+        # independent multi-label data: apply the per-class binary models and keep the full
+        # class axis. Classes without a fitted model explicitly fall back to the uncalibrated
+        # confidence - the mask is never part of the returned features.
+        if self._multilabel:
+            calibrated = self._transform_one_vs_all(X)
+            np.clip(calibrated, 0, 1, out=calibrated)
+            return calibrated
+
         self.to(self._device)
 
         # convert input data and weights to torch (and possibly to CUDA)
@@ -800,7 +859,11 @@ class AbstractLogisticRegression(AbstractCalibration):
                 # on variational inference, use mean of the variational distribution for inference
                 elif self.vi_model is not None:
                     for name, site in self._sites.items():
-                        weights[name] = torch.from_numpy(self.vi_model['params']['%s_mean' % name]).to(self._device)
+                        mean = self.vi_model['params']['%s_mean' % name]
+                        if isinstance(mean, torch.Tensor):
+                            weights[name] = mean.to(self._device)
+                        else:
+                            weights[name] = torch.from_numpy(mean).to(self._device)
 
                         if weights[name].dtype != dtype:
                             raise RuntimeError("Training dtype %s does not match to passed data dtype %s." % (weights[name].dtype, dtype))

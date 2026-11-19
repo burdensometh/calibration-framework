@@ -74,8 +74,8 @@ class IsotonicRegression(AbstractCalibration):
         self._multiclass_instances.clear()
         self._iso = None
 
-    @dimensions((1, 2), (1, 2))
-    def fit(self, X: np.ndarray, y: np.ndarray) -> 'IsotonicRegression':
+    @dimensions((1, 2), (1, 2), None)
+    def fit(self, X: np.ndarray, y: np.ndarray, mask: np.ndarray = None) -> 'IsotonicRegression':
         """
         Build Isotonic Regression model.
 
@@ -88,6 +88,12 @@ class IsotonicRegression(AbstractCalibration):
         y : np.ndarray, shape=(n_samples, [n_classes])
             NumPy array with ground truth labels.
             Either as label vector (1-D) or as one-hot encoded ground truth array (2-D).
+            In independent multi-label mode (``independent_probabilities=True``), pass a 2-D
+            array with per-class binary labels. Unknown labels are encoded as ``numpy.nan``.
+        mask : np.ndarray of bool, shape=(n_samples, [n_classes]), optional, default: None
+            Label observation mask for independent multi-label data. ``True`` marks a label as
+            known. Each class is fitted from its own observed labels only; unknown labels are
+            never treated as negatives.
 
         Returns
         -------
@@ -104,9 +110,9 @@ class IsotonicRegression(AbstractCalibration):
             if len(X.shape) == 2:
                 X = np.expand_dims(X[:, 0], axis=1)
 
-        X, y = super().fit(X, y)
+        X, y = super().fit(X, y, mask=mask)
 
-        # multiclass case: create K sub models for each label occurrence
+        # multiclass and independent multi-label case: create K sub models for each label
         if not self._is_binary_classification():
 
             # create multiple one vs all models
@@ -154,23 +160,14 @@ class IsotonicRegression(AbstractCalibration):
         X = super().transform(X)
 
         # prepare return value vector
-        calibrated = np.zeros(X.shape)
+        calibrated = np.zeros(X.shape, dtype=np.float64)
 
         # if multiclass classification problem, use binning models for each label separately
         if not self._is_binary_classification():
 
-            # get all available labels and iterate over each one
-            for (label, binning_model) in self._multiclass_instances:
-                onevsall_confidence = self._get_one_vs_all_confidence(X, label)
-                onevsall_calibrated = binning_model.transform(onevsall_confidence)
-
-                # choose right position for submodel's calibration
-                calibrated[:, label] = onevsall_calibrated
-
-            if not self.independent_probabilities:
-                # normalize to keep probability sum of 1
-                normalizer = np.sum(calibrated, axis=1, keepdims=True)
-                calibrated = np.divide(calibrated, normalizer)
+            # apply the per-class models; classes without a fitted model explicitly fall back
+            # to their uncalibrated confidence and the full class axis is kept
+            calibrated = self._transform_one_vs_all(X)
 
         # on binary classification, it's much easier
         else:

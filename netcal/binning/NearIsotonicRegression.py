@@ -108,6 +108,15 @@ class NearIsotonicRegression(AbstractCalibration):
                                      "an array of ground truth and confidence values")
 
             X, y = super().fit(X, y)
+
+            # the mPAVA algorithm is defined for a single binary target; per-class unknown
+            # labels (independent multi-label data) are handled by the outer one-vs-all models
+            if self._multilabel:
+                raise NotImplementedError(
+                    "NearIsotonicRegression is defined for a single binary target. Fit independent "
+                    "multi-label data with ENIR instead."
+                )
+
             if self.quick_init:
                 self.__initial_model_quick(X, y)
             else:

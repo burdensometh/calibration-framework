@@ -10,6 +10,7 @@ from typing import Union, Iterable, Tuple, List
 import numpy as np
 from scipy.stats import binned_statistic_dd
 from netcal import accepts, hpdi, squeeze_generic
+from netcal.LabelObservation import prepare_label_matrix, class_status, LabelObservationError
 
 
 class _Miscalibration(object):
@@ -147,6 +148,17 @@ class _Miscalibration(object):
             uncertainty: str = None
     ) -> Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray], List, int]:
         """ Check input data. For detailed documentation of the input parameters, check "_measure" method. """
+
+        # Unknown labels must never reach the shared binning path - that path would either
+        # crash or (worse) treat the unknown entries as negatives. Callers that use the
+        # preparation / binning routines directly (e.g. the reliability diagram) get a clear
+        # error instead of a silently polluted result.
+        if self._labels_have_unknown(y):
+            raise LabelObservationError(
+                "Labels contain unknown entries (NaN or masked). Use the metric's 'measure' method "
+                "with an observation mask instead - the shared binning path must not treat unknown "
+                "labels as negatives."
+            )
 
         # batched: interpret X and y as multiple predictions
         if not batched:
@@ -601,7 +613,9 @@ class _Miscalibration(object):
             uncertainty: str = None,
             return_map: bool = False,
             return_num_samples: bool = False,
-            return_uncertainty_map: bool = False
+            return_uncertainty_map: bool = False,
+            mask: Union[Iterable[np.ndarray], np.ndarray] = None,
+            return_class_scores: bool = False
     ) -> Union[float, Tuple]:
         """
         Measure calibration by given predictions with confidence and the according ground truth.
@@ -643,6 +657,13 @@ class _Miscalibration(object):
             If True, also return the number of samples in each bin.
         return_uncertainty_map : bool, optional, default: False
             If True, also return the average deviation of the confidence within each bin.
+        mask : np.ndarray of bool, shape=(n_samples, n_classes) or (n_samples,), optional, default: None
+            Label observation mask for independent (multi-label) data. ``True`` marks a label as
+            known. Unknown labels must *not* be treated as negatives - the same mask decides the
+            per-class denominator used by the metric.
+        return_class_scores : bool, optional, default: False
+            If True and independent multi-label data is measured, append the per-class metric
+            values (classes without observed samples are ``numpy.nan``).
 
         Returns
         -------
@@ -651,6 +672,7 @@ class _Miscalibration(object):
             If 'return_map' is True, return tuple and append miscalibration map over all bins.
             If 'return_num_samples' is True, return tuple and append the number of samples in each bin (excluding confidence dimension).
             If 'return_uncertainty' is True, return tuple and append the average standard deviation of confidence within each bin (excluding confidence dimension).
+            On independent multi-label data, also append the per-class scores if requested.
         """
 
         # check if metric is correct set
@@ -660,6 +682,30 @@ class _Miscalibration(object):
             raise AttributeError('Parameter \'metric\' must be string \'ACE\', \'ECE\' or \'MCE\'.')
         else:
             metric = metric.lower()
+
+        # independent multi-label data: either an explicit 2-D observation mask is given or a
+        # 2-D label matrix with more than two classes carries unknown entries. Route through the
+        # per-class path so that the same mask decides every per-class denominator.
+        if self._is_independent_measurement(X, y, mask):
+            return self._measure_independent(
+                X, y, metric,
+                mask=mask,
+                return_map=return_map,
+                return_num_samples=return_num_samples,
+                return_uncertainty_map=return_uncertainty_map,
+                return_class_scores=return_class_scores,
+                batched=batched,
+                uncertainty=uncertainty,
+            )
+
+        # binary classification or detection with unknown labels: drop only the samples whose
+        # label is unknown and fall back to the regular single-target path
+        if mask is not None or self._labels_have_unknown(y):
+            if batched or uncertainty is not None:
+                raise NotImplementedError(
+                    "Observation masks are not supported in batched mode or with uncertainty handling."
+                )
+            X, y = self._filter_unobserved(X, y, mask)
 
         # prepare input data
         X, matched, sample_uncertainty, bin_bounds, _ = self.prepare(X, y, batched, uncertainty)
@@ -681,7 +727,7 @@ class _Miscalibration(object):
         uncertainty_map = np.sqrt(np.mean([result[-2] for result in results], axis=0))
 
         # build output structure w.r.t. user input
-        if return_map or return_num_samples or return_uncertainty_map:
+        if return_map or return_num_samples or return_uncertainty_map or return_class_scores:
             return_value = (float(miscalibration),)
 
             if return_map:
@@ -690,7 +736,256 @@ class _Miscalibration(object):
                 return_value = return_value + (samples_map,)
             if return_uncertainty_map:
                 return_value = return_value + (uncertainty_map,)
+            if return_class_scores:
+                # a single class score is simply the overall score (binary/detection data)
+                return_value = return_value + (np.array([float(miscalibration)]),)
 
             return return_value
         else:
             return float(miscalibration)
+
+    @staticmethod
+    def _labels_have_unknown(y) -> bool:
+        """Return True if the labels carry unknown entries (NaN or a MaskedArray mask)."""
+
+        if isinstance(y, (list, tuple)):
+            return any(_Miscalibration._labels_have_unknown(y_) for y_ in y)
+
+        if isinstance(y, np.ma.MaskedArray):
+            return bool(np.ma.getmaskarray(y).any())
+
+        y = np.asarray(y)
+        return bool(np.issubdtype(y.dtype, np.floating) and np.isnan(y).any())
+
+    @staticmethod
+    def _is_independent_measurement(X, y, mask) -> bool:
+        """
+        Decide whether the data is independent (multi-label) data.
+
+        The deciding property is the *shape of the observation* per sample:
+
+        - every sample is either fully observed or fully unobserved: this is a single-label
+          multi-class target (each sample owns exactly one label), possibly with unobserved
+          samples. Fully unobserved samples are dropped; the established max-confidence path
+          applies. A one-hot encoding is additionally required on fully observed rows so that
+          a genuinely multi-label target is not mistaken for a single-label one.
+        - at least one sample is partially observed: unknown labels exist per class only, which
+          is the defining property of independent multi-label data.
+
+        A plain multi-class one-hot label matrix without unknown entries therefore keeps the
+        established multi-class behaviour.
+        """
+
+        if isinstance(y, (list, tuple)) or not isinstance(X, np.ndarray):
+            # batched input is a list of arrays and is not independent multi-label data
+            return False
+
+        y = np.asarray(y.filled(np.nan) if isinstance(y, np.ma.MaskedArray) else y)
+
+        if X.ndim != 2 or y.ndim != 2 or X.shape[1] <= 2:
+            return False
+
+        # observation matrix: which entries of y are known
+        if mask is not None:
+            observed = np.asarray(mask).astype(bool)
+            if observed.ndim != 2 or observed.shape != y.shape:
+                # a per-sample mask is consistent with a single-label target
+                return False
+        elif isinstance(y, np.ma.MaskedArray):
+            observed = ~np.ma.getmaskarray(y)
+        else:
+            observed = ~np.isnan(y)
+
+        known_per_row = observed.sum(axis=1)
+        fully_unobserved = known_per_row == 0
+        fully_observed = known_per_row == y.shape[1]
+
+        # any partially observed sample means per-class unknown labels
+        if np.any(~(fully_observed | fully_unobserved)):
+            return True
+
+        # only fully observed / fully unobserved samples: single-label target if the observed
+        # rows are a one-hot encoding, otherwise independent multi-label
+        rows = fully_observed
+        if not np.any(rows):
+            # no sample is fully observed; a single-label target is impossible here
+            return True
+
+        values = y[rows]
+        if not np.all(np.isin(values, (0.0, 1.0))):
+            return True
+
+        return not np.all(np.sum(values, axis=1) == 1.0)
+
+    @staticmethod
+    def _filter_unobserved(X, y, mask):
+        """Drop samples with unknown labels for binary classification or detection."""
+
+        if isinstance(y, np.ma.MaskedArray):
+            unknown = np.ma.getmaskarray(y)
+            unknown = unknown.any(axis=1) if unknown.ndim == 2 else unknown
+            y = np.asarray(y.filled(np.nan))
+        else:
+            y = np.asarray(y)
+            if np.issubdtype(y.dtype, np.floating):
+                unknown = np.isnan(y)
+            else:
+                unknown = np.zeros(y.shape, dtype=bool)
+            unknown = unknown.any(axis=1) if unknown.ndim == 2 else unknown
+
+        observed = ~unknown
+
+        if mask is not None:
+            mask = np.asarray(mask).astype(bool)
+            if mask.ndim == 2:
+                # a per-class mask for a single-target problem: a sample is observed only if
+                # every entry of that sample is observed
+                if mask.shape[0] != y.shape[0]:
+                    raise LabelObservationError(
+                        "Observation mask has %d rows but %d labels were provided."
+                        % (mask.shape[0], y.shape[0])
+                    )
+                observed &= mask.all(axis=1)
+            elif mask.shape[0] != y.shape[0]:
+                raise LabelObservationError(
+                    "Observation mask has %d entries but %d labels were provided."
+                    % (mask.shape[0], y.shape[0])
+                )
+            else:
+                observed &= mask
+
+        if np.asarray(X).ndim >= 1 and np.asarray(X).shape[0] == observed.shape[0]:
+            X = np.asarray(X)[observed]
+        else:
+            # batched/uncertainty input has more dimensions - not supported here
+            raise NotImplementedError(
+                "Observation masks must align with the sample axis of X for non-batched input."
+            )
+
+        return X, y[observed]
+
+    def _measure_independent(
+            self,
+            X,
+            y,
+            metric: str,
+            mask=None,
+            return_map: bool = False,
+            return_num_samples: bool = False,
+            return_uncertainty_map: bool = False,
+            return_class_scores: bool = False,
+            batched: bool = False,
+            uncertainty: str = None
+    ) -> Union[float, Tuple]:
+        """
+        Measure miscalibration of independent (multi-label) data per class.
+
+        For every class, only samples with an *observed* label in that class contribute to the
+        per-class denominator. Unknown labels are never counted as negatives. Sample and class
+        identity are preserved: every class is scored separately and the class axis is kept in
+        the returned arrays.
+
+        Aggregation over classes:
+
+        - ``ece``: support-weighted mean (each observed label contributes equally).
+        - ``ace``: unweighted mean over classes with at least one observed label.
+        - ``mce``: maximum over classes with at least one observed label.
+        """
+
+        if self.detection:
+            raise NotImplementedError(
+                "Independent (multi-label) miscalibration measurement is not defined for detection mode."
+            )
+
+        if batched or uncertainty is not None:
+            raise NotImplementedError(
+                "Independent (multi-label) miscalibration measurement does not support batched mode "
+                "or uncertainty handling."
+            )
+
+        X = np.asarray(X)
+        if X.ndim == 1:
+            X = np.reshape(X, (-1, 1))
+        if X.ndim != 2:
+            raise LabelObservationError(
+                "Independent multi-label measurement expects X with shape (n_samples, n_classes)."
+            )
+
+        if isinstance(y, (list, tuple)):
+            raise LabelObservationError(
+                "Independent multi-label measurement expects a single 2-D label matrix, not a list."
+            )
+
+        observation = prepare_label_matrix(y, mask, num_classes=X.shape[1])
+        statuses, support = class_status(observation.labels, observation.mask)
+        num_classes = X.shape[1]
+
+        # clip to (0, 1) so that every observed sample falls into the binning scheme - this keeps
+        # the per-class denominator equal to the class's observed support
+        epsilon = np.finfo(np.float64).eps
+        X = np.clip(X.astype(np.float64), epsilon, 1. - epsilon)
+
+        class_scores = np.full(num_classes, np.nan, dtype=np.float64)
+        class_maps = np.full(num_classes, np.nan, dtype=np.float64)
+        class_samples = np.zeros(num_classes, dtype=np.int64)
+        class_uncertainty = np.full(num_classes, np.nan, dtype=np.float64)
+
+        for k in range(num_classes):
+
+            if statuses[k] == 'unobserved':
+                continue
+
+            observed = observation.mask[:, k]
+            batch_X = X[observed, k]
+            batch_matched = observation.labels[observed, k]
+            batch_uncertainty = np.zeros_like(batch_X)
+
+            # the confidence of the current class is the first (and only) feature dimension;
+            # the observation mask has already selected the samples that have a known label
+            samples = np.reshape(batch_X, (-1, 1))
+            bounds = self._prepare_bins([samples], num_features=1)[0]
+
+            histograms, num_samples_hist, _, _ = self.binning(
+                bounds, samples, batch_matched, batch_X, batch_uncertainty
+            )
+
+            result = self.process(metric, *histograms, num_samples_hist=num_samples_hist)
+            class_scores[k] = result[0]
+            class_maps[k] = result[1]
+            class_samples[k] = int(support[k])
+            class_uncertainty[k] = np.sqrt(result[-2])
+
+        scored = ~np.isnan(class_scores)
+        if not np.any(scored):
+            raise LabelObservationError("No class has observed labels to measure calibration.")
+
+        if metric == 'ece':
+            weights = class_samples[scored].astype(np.float64)
+            miscalibration = float(np.sum(class_scores[scored] * weights) / np.sum(weights))
+        elif metric == 'ace':
+            miscalibration = float(np.mean(class_scores[scored]))
+        elif metric == 'mce':
+            miscalibration = float(np.max(class_scores[scored]))
+        else:
+            raise ValueError("Unknown miscalibration metric. This exception is fatal at this point. Fix your implementation.")
+
+        if return_map:
+            bin_map = class_maps
+        if return_uncertainty_map:
+            uncertainty_map = class_uncertainty
+
+        if return_map or return_num_samples or return_uncertainty_map or return_class_scores:
+            return_value = (miscalibration,)
+
+            if return_map:
+                return_value = return_value + (bin_map,)
+            if return_num_samples:
+                return_value = return_value + (class_samples,)
+            if return_uncertainty_map:
+                return_value = return_value + (uncertainty_map,)
+            if return_class_scores:
+                return_value = return_value + (class_scores,)
+
+            return return_value
+
+        return miscalibration

@@ -369,6 +369,54 @@ Most of the calibration methods are designed for binary classification
 tasks. For binning methods, multi-class calibration is performed in
 "one vs. all" by default.
 
+#### Independent multi-label calibration and unknown labels
+
+For independent (multi-label) targets, set ``independent_probabilities=True``
+in the constructor. Each class is then calibrated with its own binary model,
+but the target is a 2-D label matrix with shape ``(n_samples, n_classes)``.
+
+Unknown labels are **not** negative labels: filling them with zero (or dropping
+the whole sample) changes the calibration target and pollutes the calibration
+mapping. Instead, mark unknown labels with ``numpy.nan`` or pass an explicit
+observation mask to ``fit``:
+
+```python
+import numpy as np
+from netcal.scaling import LogisticCalibration
+
+# y has shape (n_samples, n_classes); unknown labels are encoded as NaN
+y = np.array([[1.0, np.nan, 0.0],
+              [0.0,  1.0,  np.nan],
+              [np.nan, 0.0, 1.0]])
+
+model = LogisticCalibration(independent_probabilities=True)
+model.fit(X, y)                    # or: model.fit(X, y_filled, mask=observed_mask)
+calibrated = model.transform(X)    # full class axis, shape (n_samples, n_classes)
+```
+
+The observation mask is metadata only: it never becomes part of the feature
+matrix ``X``. Each class is fitted from its own observed labels only, so known
+labels of other classes are preserved (rows are not dropped globally).
+
+After ``fit``, the model records which labels were usable:
+
+- ``model.support_`` - number of observed labels per class,
+- ``model.class_status_`` - one of ``'fitted'``, ``'unobserved'``,
+  ``'insufficient'`` or ``'degenerate'`` (all observed labels share one
+  outcome) per class,
+- ``model.fitted_classes_`` and ``model.fallback_classes_``.
+
+Classes that cannot be fitted keep their column in ``transform`` and fall back
+explicitly to their uncalibrated confidence.
+
+The calibration metrics (``netcal.metrics.ECE``, ``ACE`` and ``MCE``) accept
+the same ``mask`` argument and use it to decide every per-class denominator;
+the per-class scores are available with ``return_class_scores=True``.
+
+The validation helpers ``netcal.prepare_label_matrix`` and
+``netcal.class_status`` are available if you want to inspect the canonical
+label / mask representation yourself.
+
 Some methods such as "Isotonic Regression" utilize methods from the
 scikit-learn API [[9]](#ref9).
 

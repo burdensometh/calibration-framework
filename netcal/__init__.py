@@ -39,6 +39,21 @@ Base class
 
    AbstractCalibration
 
+Label observation contract
+--------------------------
+
+Independent (multi-label) calibration needs an explicit observation mask: an
+unknown label is not a negative label. The helpers below validate labels and
+build the canonical label/mask representation.
+
+.. autosummary::
+   :toctree: _autosummary_label_observation
+
+   prepare_label_matrix
+   class_status
+   LabelObservation
+   LabelObservationError
+
 """
 
 name = 'netcal'
@@ -49,3 +64,9 @@ from .Decorator import accepts, dimensions, global_accepts, global_dimensions
 from .Context import manual_seed, redirect
 from .Stats import hpdi, mv_cauchy_log_density
 from .Helper import squeeze_generic, meanvar, cumulative, is_in_quantile, cumulative_moments, density_from_cumulative
+from .LabelObservation import (
+    LabelObservation,
+    LabelObservationError,
+    prepare_label_matrix,
+    class_status,
+)

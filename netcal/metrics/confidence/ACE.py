@@ -62,7 +62,9 @@ class ACE(_Miscalibration):
             uncertainty: str = None,
             return_map: bool = False,
             return_num_samples: bool = False,
-            return_uncertainty_map: bool = False
+            return_uncertainty_map: bool = False,
+            mask: Union[Iterable[np.ndarray], np.ndarray] = None,
+            return_class_scores: bool = False
     ) -> Union[float, Tuple]:
         """
         Measure calibration by given predictions with confidence and the according ground truth.
@@ -102,6 +104,12 @@ class ACE(_Miscalibration):
             If True, also return the number of samples in each bin.
         return_uncertainty_map : bool, optional, default: False
             If True, also return the average deviation of the confidence within each bin.
+        mask : np.ndarray of bool, shape=(n_samples, n_classes) or (n_samples,), optional, default: None
+            Label observation mask for independent (multi-label) data. ``True`` marks a label as
+            known. Unknown labels are not negatives: the same mask decides the per-class
+            denominator of the metric.
+        return_class_scores : bool, optional, default: False
+            If True, append the per-class metric values (unobserved classes are ``numpy.nan``).
 
         Returns
         -------
@@ -116,5 +124,7 @@ class ACE(_Miscalibration):
             X=X, y=y, metric='ace', batched=batched, uncertainty=uncertainty,
             return_map=return_map,
             return_num_samples=return_num_samples,
-            return_uncertainty_map=return_uncertainty_map
+            return_uncertainty_map=return_uncertainty_map,
+            mask=mask,
+            return_class_scores=return_class_scores
         )

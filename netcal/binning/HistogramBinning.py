@@ -119,9 +119,10 @@ class HistogramBinning(AbstractCalibration):
 
         self._multiclass_instances.clear()
 
-    @dimensions((1, 2), (1, 2), None, None, None)
+    @dimensions((1, 2), (1, 2), None, None, None, None)
     def fit(self, X: np.ndarray, y: np.ndarray, random_state: int = None,
-                  tensorboard: bool = False, log_dir: str = None) -> 'HistogramBinning':
+                  tensorboard: bool = False, log_dir: str = None,
+                  mask: np.ndarray = None) -> 'HistogramBinning':
         """
         Function call to build the calibration model.
 
@@ -134,8 +135,14 @@ class HistogramBinning(AbstractCalibration):
         y : np.ndarray, shape=(n_samples, [n_classes])
             NumPy array with ground truth labels.
             Either as label vector (1-D) or as one-hot encoded ground truth array (2-D).
+            In independent multi-label mode (``independent_probabilities=True``), pass a 2-D
+            array with per-class binary labels. Unknown labels are encoded as ``numpy.nan``.
         random_state : int, optional, default: None
             Fix the random seed for the random number (only for compatibility here)
+        mask : np.ndarray of bool, shape=(n_samples, [n_classes]), optional, default: None
+            Label observation mask for independent multi-label data. ``True`` marks a label as
+            known. Each class is fitted from its own observed labels only; unknown labels are
+            never treated as negatives.
 
         Returns
         -------
@@ -146,9 +153,9 @@ class HistogramBinning(AbstractCalibration):
         # ---------------------------------------
         # decide if case is binary classification, multiclass classification or detection
 
-        X, y = super().fit(X, y)
+        X, y = super().fit(X, y, mask=mask)
 
-        # multiclass case: create K sub models for each label occurrence
+        # multiclass or independent multi-label case: create K sub models for each label
         if not self._is_binary_classification() and not self.detection:
 
             # create multiple one vs all models
@@ -261,23 +268,14 @@ class HistogramBinning(AbstractCalibration):
         X = super().transform(X)
 
         # prepare return value vector
-        calibrated = np.zeros_like(X)
+        calibrated = np.zeros_like(X, dtype=np.float64)
 
         # if multiclass classification problem, use binning models for each label separately
         if not self._is_binary_classification() and not self.detection:
 
-            # get all available labels and iterate over each one
-            for (label, binning_model) in self._multiclass_instances:
-                onevsall_confidence = self._get_one_vs_all_confidence(X, label)
-                onevsall_calibrated = binning_model.transform(onevsall_confidence)
-
-                # choose right position for submodel's calibration
-                calibrated[:, label] = onevsall_calibrated
-
-            if not self.independent_probabilities:
-                # normalize to keep probability sum of 1
-                normalizer = np.sum(calibrated, axis=1, keepdims=True)
-                calibrated = np.divide(calibrated, normalizer)
+            # apply the per-class models; classes without a fitted model explicitly fall back
+            # to their uncalibrated confidence and the full class axis is kept
+            calibrated = self._transform_one_vs_all(X)
 
         else:
 

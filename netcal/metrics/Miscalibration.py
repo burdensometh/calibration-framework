@@ -9,7 +9,7 @@ from typing import Union, Iterable, Tuple, List
 
 import numpy as np
 from scipy.stats import binned_statistic_dd
-from netcal import accepts, hpdi, squeeze_generic
+from netcal import accepts, hpdi, squeeze_generic, check_sample_weight
 
 
 class _Miscalibration(object):
@@ -77,7 +77,7 @@ class _Miscalibration(object):
 
         # prepare data - first, use "mean" to obtain the mean prediction of the posterior predictive
         # use flattened confidence estimates in order to get a better evaluation of the accuracy within each bin
-        X_mean, _, sample_uncertainty, bin_bounds, num_features = self.prepare(X, y, batched, uncertainty=uncertainty)
+        X_mean, _, sample_uncertainty, bin_bounds, num_features, _ = self.prepare(X, y, batched, uncertainty=uncertainty)
 
         # convert mean variance to mean std deviation
         uncertainty = [np.sqrt(var) for var in sample_uncertainty]
@@ -144,8 +144,9 @@ class _Miscalibration(object):
             X: Union[Iterable[np.ndarray], np.ndarray],
             y: Union[Iterable[np.ndarray], np.ndarray],
             batched: bool = False,
-            uncertainty: str = None
-    ) -> Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray], List, int]:
+            uncertainty: str = None,
+            sample_weight: Union[Iterable[np.ndarray], np.ndarray] = None
+    ) -> Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray], List, int, List]:
         """ Check input data. For detailed documentation of the input parameters, check "_measure" method. """
 
         # batched: interpret X and y as multiple predictions
@@ -153,12 +154,24 @@ class _Miscalibration(object):
             assert isinstance(X, np.ndarray), 'Parameter \'X\' must be Numpy array if not on batched mode.'
             assert isinstance(y, np.ndarray), 'Parameter \'y\' must be Numpy array if not on batched mode.'
             X, y = [X], [y]
+            sample_weight = [sample_weight]
 
         # if we're in batched mode, create new lists for X and y to prevent overriding
         else:
             assert isinstance(X, (list, tuple)), 'Parameter \'X\' must be type list on batched mode.'
             assert isinstance(y, (list, tuple)), 'Parameter \'y\' must be type list on batched mode.'
             X, y = [x for x in X], [y_ for y_ in y]
+
+            # on batched mode, the sample weights must also be given for each batch separately
+            if sample_weight is None:
+                sample_weight = [None] * len(X)
+            else:
+                assert isinstance(sample_weight, (list, tuple)), \
+                    'Parameter \'sample_weight\' must be type list on batched mode.'
+                sample_weight = [w for w in sample_weight]
+
+        assert len(sample_weight) == len(X), \
+            'Amount of sample weight instances must match the number of batches.'
 
         # if input X is of type "np.ndarray", convert first axis to list
         # this is necessary for the following operations
@@ -169,7 +182,7 @@ class _Miscalibration(object):
             y = [y0 for y0 in y]
 
         # empty list to collect uncertainty estimates for each sample provided in each batch
-        matched, sample_uncertainty = [], []
+        matched, sample_uncertainty, weights = [], [], []
 
         num_features = -1
         for i, (batch_X, batch_y) in enumerate(zip(X, y)):
@@ -178,6 +191,21 @@ class _Miscalibration(object):
             if batch_X.ndim == 1:
                 X[i] = batch_X = np.reshape(batch_X, (-1, 1))
 
+            # number of samples before uncertainty processing
+            # (on 3-D input, the first dim holds the stochastic forward passes, the second one the samples)
+            if batch_X.ndim == 3:
+                num_samples = batch_X.shape[1]
+            elif uncertainty is not None and batch_X.ndim == 2 \
+                    and batch_X.shape[0] != batch_y.shape[-1] and batch_X.shape[1] == batch_y.shape[-1]:
+                # 2-D input on uncertainty mode without a dedicated feature dimension:
+                # the samples are on the second dim (same detection as within uncertainty processing)
+                num_samples = batch_X.shape[1]
+            else:
+                num_samples = batch_X.shape[0]
+
+            # check optional sample weights - those are aligned to the samples by their position (sample ID)
+            batch_weight = check_sample_weight(sample_weight[i], num_samples)
+
             # -------------------------------------------------
             # process uncertainty mode first
             batch_X, batch_y, batch_uncertainty = self._prepare_uncertainty(batch_X, batch_y, uncertainty)
@@ -185,6 +213,13 @@ class _Miscalibration(object):
 
             # uncertainty (std deviation) of X values of current batch
             sample_uncertainty.append(batch_uncertainty)
+
+            # on uncertainty type 'flatten', the samples are repeated by the amount of stochastic
+            # forward passes - repeat the sample weights accordingly to keep them aligned to the samples
+            if batch_weight is not None and batch_X.shape[0] != num_samples:
+                batch_weight = np.tile(batch_weight, batch_X.shape[0] // num_samples)
+
+            weights.append(batch_weight)
 
             # -------------------------------------------------
             # check and prepare input data
@@ -208,9 +243,10 @@ class _Miscalibration(object):
 
         bin_bounds = self._prepare_bins(X, num_features)
 
-        return X, matched, sample_uncertainty, bin_bounds, num_features
+        return X, matched, sample_uncertainty, bin_bounds, num_features, weights
 
-    def binning(self, bin_bounds: List, samples: np.ndarray, *values: Iterable, nan: float = 0.0) -> Tuple:
+    def binning(self, bin_bounds: List, samples: np.ndarray, *values: Iterable, nan: float = 0.0,
+                weights: np.ndarray = None) -> Tuple:
         """
         Perform binning on value (and all additional values passed) based on samples.
 
@@ -225,6 +261,11 @@ class _Miscalibration(object):
         nan : float, optional default: 0.0
             If a bin has no samples or less than defined sample_threshold, the according bin is marked as
             NaN. Specify fill float to insert instead of NaN.
+        weights : np.ndarray of shape (n_samples,), optional, default: None
+            Non-negative sample weights aligned to the samples by their position (sample ID).
+            If given, the histogram with the number of samples holds the sum of the weights within
+            each bin (used as the denominator) and the binned values are weighted means instead of
+            ordinary means. If None, all samples are weighted equally.
 
         Returns
         -------
@@ -233,14 +274,30 @@ class _Miscalibration(object):
         """
 
         # determine number of samples in histogram bins
-        num_samples_hist, _ = np.histogramdd(samples, bins=bin_bounds)
+        # on given sample weights, this histogram holds the sum of the weights within each bin
+        # and is used as the denominator for the weighted means as well as for the miscalibration scores
+        num_samples_hist, _ = np.histogramdd(samples, bins=bin_bounds, weights=weights)
         binning_schemes = []
         binning_result = None
 
         # iterate over passed value arrays
         for val in values:
-            binning_result = binned_statistic_dd(samples, val, statistic='mean', bins=bin_bounds, binned_statistic_result=binning_result)
-            hist, _, _ = binning_result
+
+            if weights is None:
+                binning_result = binned_statistic_dd(samples, val, statistic='mean', bins=bin_bounds, binned_statistic_result=binning_result)
+                hist, _, _ = binning_result
+
+            # on given sample weights, compute the weighted mean within each bin by the sum of the
+            # weighted values divided by the sum of the weights (denominator) within each bin
+            else:
+                binning_result = binned_statistic_dd(samples, val * weights, statistic='sum', bins=bin_bounds, binned_statistic_result=binning_result)
+                weighted_sum, _, _ = binning_result
+
+                hist = np.divide(
+                    weighted_sum, num_samples_hist,
+                    out=np.full_like(weighted_sum, np.nan),
+                    where=num_samples_hist != 0
+                )
 
             # blank out each bin that has less samples than a certain sample threshold in order
             # to improve robustness of the miscalibration scores
@@ -601,7 +658,8 @@ class _Miscalibration(object):
             uncertainty: str = None,
             return_map: bool = False,
             return_num_samples: bool = False,
-            return_uncertainty_map: bool = False
+            return_uncertainty_map: bool = False,
+            sample_weight: Union[Iterable[np.ndarray], np.ndarray] = None
     ) -> Union[float, Tuple]:
         """
         Measure calibration by given predictions with confidence and the according ground truth.
@@ -643,6 +701,12 @@ class _Miscalibration(object):
             If True, also return the number of samples in each bin.
         return_uncertainty_map : bool, optional, default: False
             If True, also return the average deviation of the confidence within each bin.
+        sample_weight : iterable of np.ndarray, or np.ndarray of shape=(n_samples,), optional, default: None
+            NumPy array with non-negative sample weights that are aligned to the samples by their
+            position (sample ID). If given, the confidence, the accuracy and the number of samples
+            (denominator) within each bin are weighted by those weights. Samples with a weight of
+            zero do not affect the metric. On batched mode, pass a list of arrays (one per batch).
+            If None, all samples are weighted equally.
 
         Returns
         -------
@@ -662,14 +726,19 @@ class _Miscalibration(object):
             metric = metric.lower()
 
         # prepare input data
-        X, matched, sample_uncertainty, bin_bounds, _ = self.prepare(X, y, batched, uncertainty)
+        X, matched, sample_uncertainty, bin_bounds, _, weights = self.prepare(
+            X, y, batched, uncertainty, sample_weight=sample_weight
+        )
 
         # iterate over all batches of X and matched and calculate average miscalibration
         results = []
-        for batch_X, batch_matched, batch_uncertainty, bounds in zip(X, matched, sample_uncertainty, bin_bounds):
+        for batch_X, batch_matched, batch_uncertainty, bounds, batch_weight in zip(
+                X, matched, sample_uncertainty, bin_bounds, weights):
 
             # perform binning on input arrays and drop last outcome (idx bin indices are not needed here)
-            histograms, num_samples_hist, _, _ = self.binning(bounds, batch_X, batch_matched, batch_X[:, 0], batch_uncertainty[:, 0])
+            histograms, num_samples_hist, _, _ = self.binning(
+                bounds, batch_X, batch_matched, batch_X[:, 0], batch_uncertainty[:, 0], weights=batch_weight
+            )
 
             result = self.process(metric, *histograms, num_samples_hist=num_samples_hist)
             results.append(result)

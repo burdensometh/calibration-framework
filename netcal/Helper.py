@@ -59,6 +59,60 @@ def _extract_input(X: Iterable[np.ndarray]) -> Tuple[np.ndarray, np.ndarray, boo
     return mean, stddev, cov
 
 
+def check_sample_weight(
+        sample_weight: Union[Iterable, np.ndarray, None],
+        n_samples: int
+) -> Union[np.ndarray, None]:
+    """
+    Check and convert optional sample weights. Sample weights are non-negative values that are aligned
+    to the samples by their position (sample ID), i.e. the i-th weight belongs to the i-th sample.
+    Weights of zero are valid and exclude the according samples from any weighted estimate.
+    If no weights are given (None), this function simply returns None.
+
+    Parameters
+    ----------
+    sample_weight : iterable or np.ndarray of shape (n_samples,), or None
+        Non-negative sample weights with one weight per sample.
+    n_samples : int
+        Number of samples the weights have to be aligned to.
+
+    Returns
+    -------
+    np.ndarray of shape (n_samples,) or None
+        The sample weights as 1-D NumPy float array or None if no weights have been provided.
+
+    Raises
+    ------
+    ValueError
+        If the weights are not 1-D, do not match the number of samples, contain negative or
+        non-finite values, or if all weights are zero.
+    """
+
+    if sample_weight is None:
+        return None
+
+    sample_weight = squeeze_generic(np.asarray(sample_weight, dtype=np.float64), axes_to_keep=0)
+
+    if sample_weight.ndim != 1:
+        raise ValueError("Parameter 'sample_weight' must be a 1-D array with one weight per sample.")
+
+    if sample_weight.shape[0] != n_samples:
+        raise ValueError("Number of samples given by 'sample_weight' (%d) does not match the number of "
+                         "samples provided (%d)." % (sample_weight.shape[0], n_samples))
+
+    if not np.all(np.isfinite(sample_weight)):
+        raise ValueError("Parameter 'sample_weight' must not contain NaN or infinite values.")
+
+    if np.any(sample_weight < 0):
+        raise ValueError("Parameter 'sample_weight' must not contain negative values.")
+
+    if not np.any(sample_weight > 0):
+        raise ValueError("Parameter 'sample_weight' must contain at least one positive weight "
+                         "(all weights are zero).")
+
+    return sample_weight
+
+
 def squeeze_generic(a: np.ndarray, axes_to_keep: Union[int, Iterable[int]]) -> np.ndarray:
     """
     Squeeze input array a but keep axes defined by parameter 'axes_to_keep' even if the dimension is

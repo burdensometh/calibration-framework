@@ -48,4 +48,4 @@ from .AbstractCalibration import AbstractCalibration
 from .Decorator import accepts, dimensions, global_accepts, global_dimensions
 from .Context import manual_seed, redirect
 from .Stats import hpdi, mv_cauchy_log_density
-from .Helper import squeeze_generic, meanvar, cumulative, is_in_quantile, cumulative_moments, density_from_cumulative
+from .Helper import squeeze_generic, meanvar, cumulative, is_in_quantile, cumulative_moments, density_from_cumulative, check_sample_weight

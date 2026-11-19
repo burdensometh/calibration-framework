@@ -28,7 +28,7 @@ from pyro.infer import SVI, Trace_ELBO, Predictive, MCMC, NUTS
 from pyro.optim import Adam, SGD
 import pyro.distributions as dist
 
-from netcal import AbstractCalibration, dimensions, accepts, manual_seed, squeeze_generic
+from netcal import AbstractCalibration, dimensions, accepts, manual_seed, squeeze_generic, check_sample_weight
 
 
 class AbstractLogisticRegression(AbstractCalibration):
@@ -340,11 +340,12 @@ class AbstractLogisticRegression(AbstractCalibration):
             for key, param in self.mcmc_model.items():
                 self.mcmc_model[key] = param.detach().to(device)
 
-    @dimensions((1, 2), (1, 2), None, None, None)
+    @dimensions((1, 2), (1, 2), None, None, None, None)
     def fit(
             self,
             X: np.ndarray,
             y: np.ndarray,
+            sample_weight: np.ndarray = None,
             random_state: int = None,
             tensorboard: bool = True,
             log_dir: str = None
@@ -362,6 +363,13 @@ class AbstractLogisticRegression(AbstractCalibration):
         y : np.ndarray, shape=(n_samples, [n_classes])
             NumPy array with ground truth labels.
             Either as label vector (1-D) or as one-hot encoded ground truth array (2-D).
+        sample_weight : np.ndarray, shape=(n_samples,), optional, default: None
+            NumPy array with non-negative sample weights for the loss function (e.g. to compensate
+            over- or under-sampling of certain categories within the calibration set).
+            The weights are aligned to the samples by their position (sample ID) and are solely used
+            to weight the loss during fitting - they are never used as (additional) input features.
+            Samples with a weight of zero do not affect the fit. Currently only supported for
+            method 'mle'. If None, all samples are weighted equally.
         random_state : int, optional, default: None
             Fix the random seed for the random number
 
@@ -372,6 +380,12 @@ class AbstractLogisticRegression(AbstractCalibration):
         """
 
         X, y = super().fit(X, y)
+
+        # check optional sample weights - those are aligned to the samples by their position (sample ID)
+        sample_weight = check_sample_weight(sample_weight, X.shape[0])
+
+        if sample_weight is not None and self.method != 'mle':
+            raise NotImplementedError("Parameter 'sample_weight' is currently only supported for method 'mle'.")
 
         # prepare data input for algorithm
         data = self.prepare(X).to(self._device)
@@ -408,7 +422,7 @@ class AbstractLogisticRegression(AbstractCalibration):
 
             # Maximum likelihood estimate (without uncertainty)
             elif self.method == 'mle':
-                self.convex(data, y, tensorboard, log_dir)
+                self.convex(data, y, tensorboard, log_dir, sample_weight=sample_weight)
 
             # momentum is for non-convex optimization
             elif self.method == 'momentum':
@@ -547,7 +561,8 @@ class AbstractLogisticRegression(AbstractCalibration):
         if tensorboard:
             writer.close()
 
-    def convex(self, data: torch.Tensor, y: torch.Tensor, tensorboard: bool, log_dir: str):
+    def convex(self, data: torch.Tensor, y: torch.Tensor, tensorboard: bool, log_dir: str,
+               sample_weight: np.ndarray = None):
         """
         Convex optimization to find the global optimum of current parameter search.
 
@@ -557,9 +572,21 @@ class AbstractLogisticRegression(AbstractCalibration):
             NumPy 2-D array with data input.
         y : np.ndarray, shape=(n_samples,)
             NumPy array with ground truth labels as 1-D vector (binary).
+        sample_weight : np.ndarray, shape=(n_samples,), optional, default: None
+            NumPy array with non-negative sample weights used to weight the loss of each sample.
+            The weights are aligned to the samples by their position (sample ID).
+            Samples with a weight of zero do not contribute to the loss.
+            If None, all samples are weighted equally.
         """
 
         dtype = data.dtype
+
+        # convert optional sample weights to a torch tensor that matches the data dtype
+        # the weights are used to compute a weighted mean over the per-sample losses, so that
+        # zero-weight samples do not affect the optimization
+        if sample_weight is not None:
+            weight_tensor = torch.from_numpy(sample_weight).to(dtype=dtype, device=self._device)
+            weight_sum = torch.sum(weight_tensor)
 
         # optimization objective function
         # compute NLL loss - fix weights given of the model for the current iteration step
@@ -586,14 +613,30 @@ class AbstractLogisticRegression(AbstractCalibration):
 
             # for an arbitrary reason, binary_cross_entropy_with_logits returns NaN
             # thus, we need to use the bce loss with sigmoid
-            def loss_op(x, y):
-                return torch.nn.BCELoss(reduction='mean')(torch.sigmoid(x), y)
+            if sample_weight is None:
+                def loss_op(x, y):
+                    return torch.nn.BCELoss(reduction='mean')(torch.sigmoid(x), y)
+
+            # weight the loss of each sample and compute a weighted mean over all samples
+            else:
+                def loss_op(x, y):
+                    loss = torch.nn.BCELoss(reduction='none')(torch.sigmoid(x), y)
+                    return torch.sum(loss * weight_tensor) / weight_sum
 
             y = y.to(dtype=dtype)
 
         # on multiclass classification, use multiclass cross entropy loss and convert target vector to long
         else:
-            loss_op = torch.nn.CrossEntropyLoss(reduction='mean')
+            if sample_weight is None:
+                loss_op = torch.nn.CrossEntropyLoss(reduction='mean')
+
+            # weight the loss of each sample and compute a weighted mean over all samples
+            else:
+                cross_entropy = torch.nn.CrossEntropyLoss(reduction='none')
+
+                def loss_op(x, y):
+                    return torch.sum(cross_entropy(x, y) * weight_tensor) / weight_sum
+
             y = y.long()
 
         # convert pytorch optim bounds to scipy optimization format

@@ -62,7 +62,8 @@ class ECE(_Miscalibration):
             uncertainty: str = None,
             return_map: bool = False,
             return_num_samples: bool = False,
-            return_uncertainty_map: bool = False
+            return_uncertainty_map: bool = False,
+            sample_weight: Union[Iterable[np.ndarray], np.ndarray] = None
     ) -> Union[float, Tuple]:
         """
         Measure calibration by given predictions with confidence and the according ground truth.
@@ -102,6 +103,13 @@ class ECE(_Miscalibration):
             If True, also return the number of samples in each bin.
         return_uncertainty_map : bool, optional, default: False
             If True, also return the average deviation of the confidence within each bin.
+        sample_weight : iterable of np.ndarray, or np.ndarray of shape=(n_samples,), optional, default: None
+            NumPy array with non-negative sample weights that are aligned to the samples by their
+            position (sample ID), e.g. to compensate over- or under-sampling of certain categories
+            within the calibration set. If given, the confidence, the accuracy and the number of
+            samples (denominator) within each bin are weighted by those weights. Samples with a
+            weight of zero do not affect the metric. On batched mode, pass a list of arrays
+            (one per batch). If None, all samples are weighted equally.
 
         Returns
         -------
@@ -116,5 +124,6 @@ class ECE(_Miscalibration):
             X=X, y=y, metric='ece', batched=batched, uncertainty=uncertainty,
             return_map=return_map,
             return_num_samples=return_num_samples,
-            return_uncertainty_map=return_uncertainty_map
+            return_uncertainty_map=return_uncertainty_map,
+            sample_weight=sample_weight
         )

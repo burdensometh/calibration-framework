@@ -193,7 +193,7 @@ class ReliabilityDiagram(object):
             self.metric = self.metric.lower()
 
         # perform checks and prepare input data
-        X, matched, sample_uncertainty, bin_bounds, num_features = self._miscalibration.prepare(X, y, batched, uncertainty)
+        X, matched, sample_uncertainty, bin_bounds, num_features, _ = self._miscalibration.prepare(X, y, batched, uncertainty)
         if num_features > 3:
             raise AttributeError("Diagram is not defined for more than 2 additional feature dimensions.")
 
